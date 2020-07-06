@@ -173,6 +173,8 @@ pub enum InvalidAccessKeyError {
     BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq, RpcError,
 )]
 pub enum ActionsValidationError {
+    /// The delete action must be a final aciton in transaction
+    DeleteActionMustBeFinal,
     /// The total prepaid gas (for all given actions) exceeded the limit.
     TotalPrepaidGasExceeded { total_prepaid_gas: Gas, limit: Gas },
     /// The number of actions exceeded the given limit.
@@ -253,6 +255,9 @@ impl Display for ReceiptValidationError {
 impl Display for ActionsValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         match self {
+            ActionsValidationError::DeleteActionMustBeFinal => {
+                write!(f, "The delete action must be the last action in transaction")
+            }
             ActionsValidationError::TotalPrepaidGasExceeded { total_prepaid_gas, limit } => {
                 write!(f, "The total prepaid gas {} exceeds the limit {}", total_prepaid_gas, limit)
             }
@@ -366,6 +371,13 @@ pub enum ActionErrorKind {
         locked: Balance,
         #[serde(with = "u128_dec_format")]
         balance: Balance,
+    },
+    InsufficientStake {
+        account_id: AccountId,
+        #[serde(with = "u128_dec_format")]
+        stake: Balance,
+        #[serde(with = "u128_dec_format")]
+        minimum_stake: Balance,
     },
     /// An error occurred during a `FunctionCall` Action.
     FunctionCallError(FunctionCallError),
@@ -590,6 +602,12 @@ impl From<InvalidTxError> for RuntimeError {
     }
 }
 
+impl From<EpochError> for RuntimeError {
+    fn from(e: EpochError) -> Self {
+        RuntimeError::ValidatorError(e)
+    }
+}
+
 impl Display for ActionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         write!(f, "Action #{}: {}", self.index.unwrap_or_default(), self.kind)
@@ -652,6 +670,7 @@ impl Display for ActionErrorKind {
             ActionErrorKind::NewReceiptValidationError(e) => {
                 write!(f, "An new action receipt created during a FunctionCall is not valid: {}", e)
             }
+            ActionErrorKind::InsufficientStake { account_id, stake, minimum_stake } => write!(f, "Account {} tries to stake {} but minimum required stake is {}", account_id, stake, minimum_stake)
         }
     }
 }

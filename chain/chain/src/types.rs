@@ -13,28 +13,17 @@ use near_primitives::errors::InvalidTxError;
 use near_primitives::hash::{hash, CryptoHash};
 use near_primitives::merkle::{merklize, MerklePath};
 use near_primitives::receipt::Receipt;
-use near_primitives::sharding::{ReceiptProof, ShardChunk, ShardChunkHeader};
+use near_primitives::sharding::ShardChunkHeader;
 use near_primitives::transaction::{ExecutionOutcomeWithId, SignedTransaction};
 use near_primitives::types::{
     AccountId, ApprovalStake, Balance, BlockHeight, EpochId, Gas, MerkleHash, ShardId, StateRoot,
-    StateRootNode, ValidatorStake, ValidatorStats,
+    StateRootNode, ValidatorStake,
 };
+use near_primitives::version::ProtocolVersion;
 use near_primitives::views::{EpochValidatorInfo, QueryRequest, QueryResponse};
 use near_store::{PartialStorage, ShardTries, Store, StoreUpdate, Trie, WrappedTrieChanges};
 
 use crate::error::Error;
-
-#[derive(PartialEq, Eq, Clone, Debug, BorshSerialize, BorshDeserialize, Serialize)]
-pub struct ReceiptResponse(pub CryptoHash, pub Vec<Receipt>);
-
-#[derive(PartialEq, Eq, Clone, Debug, BorshSerialize, BorshDeserialize, Serialize)]
-pub struct ReceiptProofResponse(pub CryptoHash, pub Vec<ReceiptProof>);
-
-#[derive(PartialEq, Eq, Clone, Debug, BorshSerialize, BorshDeserialize, Serialize)]
-pub struct RootProof(pub CryptoHash, pub MerklePath);
-
-#[derive(PartialEq, Eq, Clone, Debug, BorshSerialize, BorshDeserialize, Serialize)]
-pub struct StatePartKey(pub CryptoHash, pub ShardId, pub u64 /* PartId */);
 
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub enum BlockStatus {
@@ -103,6 +92,41 @@ impl ApplyTransactionResult {
     }
 }
 
+/// Compressed information about block.
+/// Useful for epoch manager.
+#[derive(Default, BorshSerialize, BorshDeserialize, Serialize, Clone, Debug)]
+pub struct BlockHeaderInfo {
+    pub hash: CryptoHash,
+    pub prev_hash: CryptoHash,
+    pub height: BlockHeight,
+    pub random_value: CryptoHash,
+    pub last_finalized_height: BlockHeight,
+    pub last_finalized_block_hash: CryptoHash,
+    pub proposals: Vec<ValidatorStake>,
+    pub slashed_validators: Vec<SlashedValidator>,
+    pub chunk_mask: Vec<bool>,
+    pub total_supply: Balance,
+    pub latest_protocol_version: ProtocolVersion,
+}
+
+impl BlockHeaderInfo {
+    pub fn new(header: &BlockHeader, last_finalized_height: u64) -> Self {
+        Self {
+            hash: *header.hash(),
+            prev_hash: *header.prev_hash(),
+            height: header.height(),
+            random_value: *header.random_value(),
+            last_finalized_height,
+            last_finalized_block_hash: *header.last_final_block(),
+            proposals: header.validator_proposals().to_vec(),
+            slashed_validators: vec![],
+            chunk_mask: header.chunk_mask().to_vec(),
+            total_supply: header.total_supply(),
+            latest_protocol_version: header.latest_protocol_version(),
+        }
+    }
+}
+
 /// Bridge between the chain and the runtime.
 /// Main function is to update state given transactions.
 /// Additionally handles validators.
@@ -123,8 +147,8 @@ pub trait RuntimeAdapter: Send + Sync {
         epoch_id: &EpochId,
         block_height: BlockHeight,
         prev_random_value: &CryptoHash,
-        vrf_value: near_crypto::vrf::Value,
-        vrf_proof: near_crypto::vrf::Proof,
+        vrf_value: &near_crypto::vrf::Value,
+        vrf_proof: &near_crypto::vrf::Proof,
     ) -> Result<(), Error>;
 
     /// Validates a given signed transaction.
@@ -237,14 +261,6 @@ pub trait RuntimeAdapter: Send + Sync {
         account_id: &AccountId,
     ) -> Result<(ValidatorStake, bool), Error>;
 
-    /// Number of missed blocks for given block producer.
-    fn get_num_validator_blocks(
-        &self,
-        epoch_id: &EpochId,
-        last_known_block_hash: &CryptoHash,
-        account_id: &AccountId,
-    ) -> Result<ValidatorStats, Error>;
-
     /// Get current number of shards.
     fn num_shards(&self) -> ShardId;
 
@@ -308,19 +324,11 @@ pub trait RuntimeAdapter: Send + Sync {
     /// Amount of tokens minted in given epoch.
     fn get_epoch_minted_amount(&self, epoch_id: &EpochId) -> Result<Balance, Error>;
 
+    /// Epoch active protocol version.
+    fn get_epoch_protocol_version(&self, epoch_id: &EpochId) -> Result<ProtocolVersion, Error>;
+
     /// Add proposals for validators.
-    fn add_validator_proposals(
-        &self,
-        parent_hash: CryptoHash,
-        current_hash: CryptoHash,
-        rng_seed: CryptoHash,
-        height: BlockHeight,
-        last_finalized_height: BlockHeight,
-        proposals: Vec<ValidatorStake>,
-        slashed_validators: Vec<SlashedValidator>,
-        validator_mask: Vec<bool>,
-        total_supply: Balance,
-    ) -> Result<(), Error>;
+    fn add_validator_proposals(&self, block_header_info: BlockHeaderInfo) -> Result<(), Error>;
 
     /// Apply transactions to given state root and return store update and new state root.
     /// Also returns transaction result for each transaction and new receipts.
@@ -477,23 +485,6 @@ pub struct LatestKnown {
     pub seen: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize)]
-pub struct ShardStateSyncResponseHeader {
-    pub chunk: ShardChunk,
-    pub chunk_proof: MerklePath,
-    pub prev_chunk_header: Option<ShardChunkHeader>,
-    pub prev_chunk_proof: Option<MerklePath>,
-    pub incoming_receipts_proofs: Vec<ReceiptProofResponse>,
-    pub root_proofs: Vec<Vec<RootProof>>,
-    pub state_root_node: StateRootNode,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize)]
-pub struct ShardStateSyncResponse {
-    pub header: Option<ShardStateSyncResponseHeader>,
-    pub part: Option<(u64, Vec<u8>)>,
-}
-
 /// When running block sync response to know if the node needs to sync state,
 /// or the hashes from the blocks that are needed.
 pub enum BlockSyncResponse {
@@ -514,6 +505,7 @@ mod tests {
     use near_primitives::merkle::verify_path;
     use near_primitives::transaction::{ExecutionOutcome, ExecutionStatus};
     use near_primitives::validator_signer::InMemoryValidatorSigner;
+    use near_primitives::version::PROTOCOL_VERSION;
 
     use crate::Chain;
 
@@ -524,6 +516,7 @@ mod tests {
         let num_shards = 32;
         let genesis_chunks = genesis_chunks(vec![StateRoot::default()], num_shards, 1_000_000, 0);
         let genesis = Block::genesis(
+            PROTOCOL_VERSION,
             genesis_chunks.into_iter().map(|chunk| chunk.header).collect(),
             Utc::now(),
             0,
@@ -533,20 +526,20 @@ mod tests {
         );
         let signer = InMemoryValidatorSigner::from_seed("other", KeyType::ED25519, "other");
         let b1 = Block::empty(&genesis, &signer);
-        assert!(b1.header.verify_block_producer(&signer.public_key()));
+        assert!(b1.header().verify_block_producer(&signer.public_key()));
         let other_signer = InMemoryValidatorSigner::from_seed("other2", KeyType::ED25519, "other2");
-        let approvals = vec![Some(Approval::new(b1.hash(), 1, 2, &other_signer).signature)];
+        let approvals = vec![Some(Approval::new(*b1.hash(), 1, 2, &other_signer).signature)];
         let b2 = Block::empty_with_approvals(
             &b1,
             2,
-            b1.header.inner_lite.epoch_id.clone(),
-            EpochId(genesis.hash()),
+            b1.header().epoch_id().clone(),
+            EpochId(*genesis.hash()),
             approvals,
             &signer,
-            genesis.header.inner_lite.next_bp_hash,
+            *genesis.header().next_bp_hash(),
             CryptoHash::default(),
         );
-        b2.header.verify_block_producer(&signer.public_key());
+        b2.header().verify_block_producer(&signer.public_key());
     }
 
     #[test]
@@ -558,6 +551,8 @@ mod tests {
                 logs: vec!["outcome1".to_string()],
                 receipt_ids: vec![hash(&[1])],
                 gas_burnt: 100,
+                tokens_burnt: 10000,
+                executor_id: "alice".to_string(),
             },
         };
         let outcome2 = ExecutionOutcomeWithId {
@@ -567,6 +562,8 @@ mod tests {
                 logs: vec!["outcome2".to_string()],
                 receipt_ids: vec![],
                 gas_burnt: 0,
+                tokens_burnt: 0,
+                executor_id: "bob".to_string(),
             },
         };
         let outcomes = vec![outcome1, outcome2];

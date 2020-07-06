@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use actix::actors::resolver::{ConnectAddr, Resolver};
 use actix::io::FramedWrite;
 use actix::{
-    Actor, ActorFuture, Addr, AsyncContext, Context, ContextFutureSpawner, Handler, Recipient,
-    Running, StreamHandler, SystemService, WrapFuture,
+    Actor, ActorFuture, Addr, Arbiter, AsyncContext, Context, ContextFutureSpawner, Handler,
+    Recipient, Running, StreamHandler, SystemService, WrapFuture,
 };
 use chrono::Utc;
 use futures::task::Poll;
@@ -44,6 +44,7 @@ use crate::types::{
     KnownPeerState, NetworkClientMessages, NetworkConfig, NetworkRequests, NetworkResponses,
     PeerInfo,
 };
+use metrics::NetworkMetrics;
 
 /// How often to request peers from active peers.
 const REQUEST_PEERS_SECS: u64 = 60;
@@ -105,6 +106,8 @@ pub struct PeerManagerActor {
     monitor_peers_attempts: u64,
     /// Active peers we have sent new edge update, but we haven't received response so far.
     pending_update_nonce_request: HashMap<PeerId, u64>,
+    /// Dynamic Prometheus metrics
+    network_metrics: NetworkMetrics,
     /// Store all collected metrics from a node.
     #[cfg(feature = "metric_recorder")]
     metric_recorder: MetricRecorder,
@@ -138,6 +141,7 @@ impl PeerManagerActor {
             routing_table,
             monitor_peers_attempts: 0,
             pending_update_nonce_request: HashMap::new(),
+            network_metrics: NetworkMetrics::new(),
             #[cfg(feature = "metric_recorder")]
             metric_recorder,
         })
@@ -218,7 +222,7 @@ impl PeerManagerActor {
         // sending messages.
         ctx.run_later(Duration::from_secs(wait_for_sync), move |act, ctx| {
             let _ = addr.do_send(SendMessage {
-                message: PeerMessage::Sync(SyncData {
+                message: PeerMessage::RoutingTableSync(SyncData {
                     edges: known_edges,
                     accounts: known_accounts,
                 }),
@@ -235,7 +239,9 @@ impl PeerManagerActor {
                 // Wait a time out before broadcasting this new edge to let the other party finish handshake.
                 act.broadcast_message(
                     ctx,
-                    SendMessage { message: PeerMessage::Sync(SyncData::edge(new_edge)) },
+                    SendMessage {
+                        message: PeerMessage::RoutingTableSync(SyncData::edge(new_edge)),
+                    },
                 );
             }
         });
@@ -269,7 +275,9 @@ impl PeerManagerActor {
                 self.process_edge(ctx, edge_update.clone());
                 self.broadcast_message(
                     ctx,
-                    SendMessage { message: PeerMessage::Sync(SyncData::edge(edge_update)) },
+                    SendMessage {
+                        message: PeerMessage::RoutingTableSync(SyncData::edge(edge_update)),
+                    },
                 );
             }
         }
@@ -291,7 +299,7 @@ impl PeerManagerActor {
     /// This function should only be called after Peer instance is stopped.
     /// Note: Use `try_ban_peer` if there might be a Peer instance still active.
     fn ban_peer(&mut self, ctx: &mut Context<Self>, peer_id: &PeerId, ban_reason: ReasonForBan) {
-        info!(target: "network", "Banning peer {:?} for {:?}", peer_id, ban_reason);
+        warn!(target: "network", "Banning peer {:?} for {:?}", peer_id, ban_reason);
         self.remove_active_peer(ctx, peer_id, None);
         unwrap_or_error!(self.peer_store.peer_ban(peer_id, ban_reason), "Failed to save peer data");
     }
@@ -350,7 +358,11 @@ impl PeerManagerActor {
             }
         };
 
-        Peer::create(move |ctx| {
+        let network_metrics = self.network_metrics.clone();
+
+        // Start every peer actor on separate thread.
+        let arbiter = Arbiter::new();
+        Peer::start_in_arbiter(&arbiter, move |ctx| {
             let (read, write) = tokio::io::split(stream);
 
             // TODO: check if peer is banned or known based on IP address and port.
@@ -366,6 +378,7 @@ impl PeerManagerActor {
                     .map(Result::unwrap),
                 ctx,
             );
+
             Peer::new(
                 PeerInfo { id: peer_id, addr: Some(server_addr), account_id },
                 remote_addr,
@@ -377,6 +390,7 @@ impl PeerManagerActor {
                 client_addr,
                 view_client_addr,
                 edge_info,
+                network_metrics,
             )
         });
     }
@@ -449,7 +463,7 @@ impl PeerManagerActor {
 
     /// Query current peers for more peers.
     fn query_active_peers_for_more_peers(&mut self, ctx: &mut Context<Self>) {
-        let mut requests = vec![];
+        let mut requests = futures::stream::FuturesUnordered::new();
         let msg = SendMessage { message: PeerMessage::PeersRequest };
         for (_, active_peer) in self.active_peers.iter_mut() {
             if active_peer.last_time_peer_requested.elapsed().as_secs() > REQUEST_PEERS_SECS {
@@ -457,12 +471,13 @@ impl PeerManagerActor {
                 requests.push(active_peer.addr.send(msg.clone()));
             }
         }
-        future::try_join_all(requests)
-            .into_actor(self)
-            .map(|x, _, _| {
-                let _ignore = x.map_err(|e| error!(target: "network", "Failed sending broadcast message(query_active_peers): {}", e));
-            })
-            .spawn(ctx);
+        ctx.spawn(async move {
+            while let Some(response) = requests.next().await {
+                if let Err(e) = response {
+                    error!(target: "network", "Failed sending broadcast message(query_active_peers): {}", e);
+                }
+            }
+        }.into_actor(self));
     }
 
     /// Add an edge update to the routing table and return if it is a new edge update.
@@ -492,7 +507,9 @@ impl PeerManagerActor {
                 let new_edge = edge.remove_edge(act.peer_id.clone(), &act.config.secret_key);
                 act.broadcast_message(
                     ctx,
-                    SendMessage { message: PeerMessage::Sync(SyncData::edge(new_edge)) },
+                    SendMessage {
+                        message: PeerMessage::RoutingTableSync(SyncData::edge(new_edge)),
+                    },
                 );
             }
         });
@@ -717,14 +734,16 @@ impl PeerManagerActor {
     fn broadcast_message(&self, ctx: &mut Context<Self>, msg: SendMessage) {
         // TODO(MarX, #1363): Implement smart broadcasting. (MST)
 
-        let requests: Vec<_> =
+        let mut requests: futures::stream::FuturesUnordered<_> =
             self.active_peers.values().map(|peer| peer.addr.send(msg.clone())).collect();
 
-        future::try_join_all(requests)
-            .into_actor(self)
-            .map(|res, _, _| res.map_err(|e| error!(target: "network", "Failed sending broadcast message(broadcast_message): {}", e)))
-            .map(|_, _, _| ())
-            .spawn(ctx);
+        ctx.spawn(async move {
+            while let Some(response) = requests.next().await {
+                if let Err(e) = response {
+                    error!(target: "network", "Failed sending broadcast message(query_active_peers): {}", e);
+                }
+            }
+        }.into_actor(self));
     }
 
     fn announce_account(&mut self, ctx: &mut Context<Self>, announce_account: AnnounceAccount) {
@@ -733,7 +752,9 @@ impl PeerManagerActor {
             self.routing_table.add_account(announce_account.clone());
             self.broadcast_message(
                 ctx,
-                SendMessage { message: PeerMessage::Sync(SyncData::account(announce_account)) },
+                SendMessage {
+                    message: PeerMessage::RoutingTableSync(SyncData::account(announce_account)),
+                },
             );
         }
     }
@@ -748,6 +769,7 @@ impl PeerManagerActor {
     ) -> bool {
         if let Some(active_peer) = self.active_peers.get(&peer_id) {
             let msg_kind = format!("{}", message);
+            trace!(target: "network", "Send message: {}", msg_kind);
             active_peer
                 .addr
                 .send(SendMessage { message })
@@ -808,6 +830,7 @@ impl PeerManagerActor {
             Ok(peer_id) => {
                 // Remember if we expect a response for this message.
                 if msg.author == self.peer_id && msg.expect_response() {
+                    trace!(target: "network", "initiate route back {:?}", msg);
                     self.routing_table.add_route_back(msg.hash(), self.peer_id.clone());
                 }
 
@@ -815,7 +838,11 @@ impl PeerManagerActor {
             }
             Err(find_route_error) => {
                 // TODO(MarX, #1369): Message is dropped here. Define policy for this case.
-                near_metrics::inc_counter(&metrics::DROP_MESSAGE_UNREACHABLE_PEER);
+                self.network_metrics.inc(
+                    NetworkMetrics::peer_message_dropped(strum::AsStaticRef::as_static(&msg.body))
+                        .as_str(),
+                );
+
                 debug!(target: "network", "{:?} Drop signed message to {:?} Reason {:?}. Known peers: {:?} Message {:?}",
                       self.config.account_id,
                       msg.target,
@@ -848,13 +875,13 @@ impl PeerManagerActor {
             Err(find_route_error) => {
                 // TODO(MarX, #1369): Message is dropped here. Define policy for this case.
                 near_metrics::inc_counter(&metrics::DROP_MESSAGE_UNKNOWN_ACCOUNT);
-                debug!(target: "network", "{:?} Drop message to {} Reason {:?}. Known peers: {:?} Message {:?}",
+                debug!(target: "network", "{:?} Drop message to {} Reason {:?}. Message {:?}",
                        self.config.account_id,
                        account_id,
                        find_route_error,
-                       self.routing_table.get_accounts_keys(),
                        msg,
                 );
+                trace!(target: "network", "Known peers: {:?}", self.routing_table.get_accounts_keys());
                 return false;
             }
         };
@@ -1263,7 +1290,9 @@ impl Handler<NetworkRequests> for PeerManagerActor {
                                 .collect();
 
                             // Add accounts to the routing table.
-                            debug!(target: "network", "{:?} Received new accounts: {:?}", act.config.account_id, accounts);
+                            if !accounts.is_empty() {
+                                debug!(target: "network", "{:?} Received new accounts: {:?}", act.config.account_id, accounts);
+                            }
                             for account in accounts.iter() {
                                 act.routing_table.add_account(account.clone());
                             }
@@ -1273,7 +1302,7 @@ impl Handler<NetworkRequests> for PeerManagerActor {
                             if !new_data.is_empty() {
                                 act.broadcast_message(
                                     ctx,
-                                    SendMessage { message: PeerMessage::Sync(new_data) },
+                                    SendMessage { message: PeerMessage::RoutingTableSync(new_data) },
                                 )
                             };
                         }
@@ -1526,6 +1555,7 @@ impl Handler<RoutedMessageFrom> for PeerManagerActor {
         let RoutedMessageFrom { mut msg, from } = msg;
 
         if msg.expect_response() {
+            trace!(target: "network", "Received peer message that requires route back: {}", PeerMessage::Routed(msg.clone()));
             self.routing_table.add_route_back(msg.hash(), from.clone());
         }
 
@@ -1571,6 +1601,7 @@ impl Handler<PeerRequest> for PeerManagerActor {
                 PeerResponse::UpdatedEdge(self.propose_edge(peer, Some(nonce)))
             }
             PeerRequest::RouteBack(body, target) => {
+                trace!(target: "network", "Sending message to route back: {:?}", target);
                 self.send_message_to_peer(
                     ctx,
                     RawRoutedMessage { target: AccountOrPeerIdOrHash::Hash(target), body: *body },

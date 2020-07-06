@@ -450,6 +450,7 @@
         "LackBalanceForState",
         "TriesToUnstake",
         "TriesToStake",
+        "InsufficientStake",
         "FunctionCallError",
         "NewReceiptValidationError"
       ],
@@ -460,6 +461,7 @@
     "ActionsValidationError": {
       "name": "ActionsValidationError",
       "subtypes": [
+        "DeleteActionMustBeFinal",
         "TotalPrepaidGasExceeded",
         "TotalNumberOfActionsExceeded",
         "AddKeyMethodNamesNumberOfBytesExceeded",
@@ -553,6 +555,11 @@
         "account_id": ""
       }
     },
+    "DeleteActionMustBeFinal": {
+      "name": "DeleteActionMustBeFinal",
+      "subtypes": [],
+      "props": {}
+    },
     "DeleteKeyDoesNotExist": {
       "name": "DeleteKeyDoesNotExist",
       "subtypes": [],
@@ -591,6 +598,15 @@
       "name": "FunctionCallZeroAttachedGas",
       "subtypes": [],
       "props": {}
+    },
+    "InsufficientStake": {
+      "name": "InsufficientStake",
+      "subtypes": [],
+      "props": {
+        "account_id": "",
+        "minimum_stake": "",
+        "stake": ""
+      }
     },
     "InvalidAccessKeyError": {
       "name": "InvalidAccessKeyError",

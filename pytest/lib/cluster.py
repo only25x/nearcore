@@ -17,6 +17,7 @@ import rc
 from rc import gcloud
 import uuid
 import network
+from proxy import NodesProxy
 
 os.environ["ADVERSARY_CONSENT"] = "1"
 
@@ -31,7 +32,6 @@ class DownloadException(Exception):
 
 def atexit_cleanup(node):
     print("Cleaning up node %s:%s on script exit" % node.addr())
-    print("Executed refmap tests: %s" % node.refmap_tests)
     print("Executed store validity tests: %s" % node.store_tests)
     try:
         node.cleanup()
@@ -71,8 +71,19 @@ class Key(object):
         with open(jf) as f:
             return Key.from_json(json.loads(f.read()))
 
+    def to_json(self):
+        return {
+            'account_id': self.account_id,
+            'public_key': self.pk,
+            'secret_key': self.sk
+        }
+
 
 class BaseNode(object):
+    def __init__(self):
+        self._start_proxy = None
+        self._proxy_local_stopped = None
+
 
     def _get_command_line(self,
                           near_root,
@@ -123,9 +134,11 @@ class BaseNode(object):
     def get_status(self):
         r = requests.get("http://%s:%s/status" % self.rpc_addr(), timeout=2)
         r.raise_for_status()
-        self.check_refmap()
-        self.check_store()
-        return json.loads(r.content)
+        status = json.loads(r.content)
+        if status['sync_info']['syncing'] == False:
+            # Storage is not guaranteed to be in consistent state while syncing
+            self.check_store()
+        return status
 
     def get_all_heights(self):
         status = self.get_status()
@@ -194,27 +207,10 @@ class BaseNode(object):
             map(lambda v: v['account_id'],
                 self.get_status()['validators']))
 
-    def stop_checking_refmap(self):
-        print("WARN: Stopping checking Reference Map for inconsistency for %s:%s" % self.addr())
-        self.is_check_refmap = False
-
     def stop_checking_store(self):
-        print("WARN: Stopping checking Storage for inconsistency for %s:%s" % self.addr())
+        print("WARN: Stopping checking Storage for inconsistency for %s:%s" %
+              self.addr())
         self.is_check_store = False
-
-    def check_refmap(self):
-        if self.is_check_refmap:
-            res = self.json_rpc('adv_check_refmap', [])
-            if not 'result' in res:
-                # cannot check Block Reference Map for the node, possibly not Adversarial Mode is running
-                pass
-            else:
-                self.refmap_tests += 1
-                if res['result'] != 1:
-                    print(
-                        "ERROR: Block Reference Map for %s:%s in inconsistent state, stopping"
-                        % self.addr())
-                    self.kill()
 
     def check_store(self):
         if self.is_check_store:
@@ -224,9 +220,12 @@ class BaseNode(object):
                 pass
             else:
                 if res['result'] == 0:
-                    print("ERROR: Storage for %s:%s in inconsistent state, stopping" % self.addr())
+                    print(
+                        "ERROR: Storage for %s:%s in inconsistent state, stopping"
+                        % self.addr())
                     self.kill()
                 self.store_tests += res['result']
+
 
 class RpcNode(BaseNode):
     """ A running node only interact by rpc queries """
@@ -255,9 +254,7 @@ class LocalNode(BaseNode):
         self.near_root = near_root
         self.node_dir = node_dir
         self.binary_name = binary_name
-        self.refmap_tests = 0
         self.store_tests = 0
-        self.is_check_refmap = True
         self.is_check_store = True
         self.cleaned = False
         with open(os.path.join(node_dir, "config.json")) as f:
@@ -294,6 +291,7 @@ class LocalNode(BaseNode):
     def start(self, boot_key, boot_node_addr):
         env = os.environ.copy()
         env["RUST_BACKTRACE"] = "1"
+        env["RUST_LOG"] = "actix_web=warn,mio=warn,tokio_util=warn,actix_server=warn,actix_http=warn," + env.get("RUST_LOG", "debug")
 
         self.stdout_name = os.path.join(self.node_dir, 'stdout')
         self.stderr_name = os.path.join(self.node_dir, 'stderr')
@@ -305,6 +303,10 @@ class LocalNode(BaseNode):
                                           stdout=self.stdout,
                                           stderr=self.stderr,
                                           env=env).pid
+
+        if self._start_proxy is not None:
+            self._proxy_local_stopped = self._start_proxy()
+
         try:
             self.wait_for_rpc(10)
         except:
@@ -324,8 +326,16 @@ class LocalNode(BaseNode):
             os.kill(self.pid.value, signal.SIGKILL)
             self.pid.value = 0
 
+            if self._proxy_local_stopped is not None:
+                self._proxy_local_stopped.value = 1
+
     def reset_data(self):
         shutil.rmtree(os.path.join(self.node_dir, "data"))
+
+    def reset_validator_key(self, new_key):
+        self.validator_key = new_key
+        with open(os.path.join(self.node_dir, "validator_key.json"), 'w+') as f:
+            json.dump(new_key.to_json(), f)
 
     def cleanup(self):
         if self.cleaned:
@@ -451,7 +461,9 @@ chmod +x near
         return super().json_rpc(method, params, timeout=timeout)
 
     def get_status(self):
-        r = requests.get("http://%s:%s/status" % self.rpc_addr(), timeout=10)
+        r = retrying.retry(lambda: requests.get(
+            "http://%s:%s/status" % self.rpc_addr(), timeout=10),
+                           timeout=20)
         r.raise_for_status()
         return json.loads(r.content)
 
@@ -464,6 +476,13 @@ chmod +x near
         rc.run(f'gcloud compute firewall-rules delete {self.machine.name}-stop',
                input='yes\n')
 
+    def reset_validator_key(self, new_key):
+        self.validator_key = new_key
+        with open(os.path.join(self.node_dir, "validator_key.json"), 'w+') as f:
+            json.dump(new_key.to_json(), f)
+        self.machine.upload(os.path.join(self.node_dir, 'validator_key.json'),
+                            f'/home/{self.machine.username}/.near/')
+
 
 def spin_up_node(config,
                  near_root,
@@ -471,7 +490,8 @@ def spin_up_node(config,
                  ordinal,
                  boot_key,
                  boot_addr,
-                 blacklist=[]):
+                 blacklist=[],
+                 proxy=None):
     is_local = config['local']
 
     print("Starting node %s %s" % (ordinal,
@@ -501,25 +521,13 @@ def spin_up_node(config,
             remote_nodes.append(node)
         print(f"node {ordinal} machine created")
 
+    if proxy is not None:
+        proxy.proxify_node(node)
+
     node.start(boot_key, boot_addr)
     time.sleep(3)
     print(f"node {ordinal} started")
     return node
-
-
-def connect_to_mocknet(config):
-    if not config:
-        config = load_config()
-
-    if 'local' in config:
-        print("Attempt to launch a mocknet test with a regular config",
-              file=sys.stderr)
-        sys.exit(1)
-
-    return [RpcNode(node['ip'], node['port']) for node in config['nodes']], [
-        Key(account['account_id'], account['pk'], account['sk'])
-        for account in config['accounts']
-    ]
 
 
 def init_cluster(num_nodes, num_observers, num_shards, config,
@@ -595,7 +603,7 @@ def apply_config_changes(node_dir, client_config_change):
         assert k in config_json
         if isinstance(v, dict):
             for key, value in v.items():
-                assert key in config_json[k]
+                assert key in config_json[k], key
                 config_json[k][key] = value
         else:
             config_json[k] = v
@@ -604,8 +612,13 @@ def apply_config_changes(node_dir, client_config_change):
         f.write(json.dumps(config_json, indent=2))
 
 
-def start_cluster(num_nodes, num_observers, num_shards, config,
-                  genesis_config_changes, client_config_changes):
+def start_cluster(num_nodes,
+                  num_observers,
+                  num_shards,
+                  config,
+                  genesis_config_changes,
+                  client_config_changes,
+                  message_handler=None):
     if not config:
         config = load_config()
 
@@ -623,9 +636,11 @@ def start_cluster(num_nodes, num_observers, num_shards, config,
             filter(lambda n: not n.endswith('_finished'), node_dirs))
     ret = []
 
+    proxy = NodesProxy(message_handler) if message_handler is not None else None
+
     def spin_up_node_and_push(i, boot_key, boot_addr):
         node = spin_up_node(config, near_root, node_dirs[i], i, boot_key,
-                            boot_addr)
+                            boot_addr, [], proxy)
         while len(ret) < i:
             time.sleep(0.01)
         ret.append(node)

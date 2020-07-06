@@ -1,3 +1,6 @@
+#[macro_use]
+extern crate lazy_static;
+
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -11,7 +14,7 @@ use cached::{Cached, SizedCache};
 pub use db::DBCol::{self, *};
 pub use db::{
     CHUNK_TAIL_KEY, HEADER_HEAD_KEY, HEAD_KEY, LARGEST_TARGET_HEIGHT_KEY, LATEST_KNOWN_KEY,
-    SYNC_HEAD_KEY, TAIL_KEY,
+    NUM_COLS, SHOULD_COL_GC, SKIP_COL_GC, SYNC_HEAD_KEY, TAIL_KEY,
 };
 use near_crypto::PublicKey;
 use near_primitives::account::{AccessKey, Account};
@@ -31,6 +34,7 @@ pub use crate::trie::{
 };
 
 mod db;
+pub mod migrations;
 pub mod test_utils;
 mod trie;
 
@@ -201,12 +205,8 @@ impl StoreUpdate {
                     .ops
                     .iter()
                     .map(|op| match op {
-                        DBOp::Insert { col, key, .. } => {
-                            (*col as u8, key)
-                        }
-                        DBOp::Delete { col, key } => {
-                            (*col as u8, key)
-                        }
+                        DBOp::Insert { col, key, .. } => (*col as u8, key),
+                        DBOp::Delete { col, key } => (*col as u8, key),
                     })
                     .collect::<std::collections::HashSet<_>>()
                     .len(),

@@ -52,16 +52,16 @@ fn main() {
         process::exit(1);
     }
     println!(
-        "Conditions validated: {}",
+        "{} {}",
+        White.bold().paint("Conditions validated:"),
         Green.bold().paint(store_validator.tests_done().to_string())
     );
     for error in store_validator.errors.iter() {
         println!(
-            "{} > {} > {} > {}",
-            Red.bold().paint(&error.func.to_string()),
-            Yellow.bold().paint(&error.col.unwrap().to_string()),
-            White.bold().paint(error.key.as_ref().unwrap()),
-            error.reason
+            "{}  {}  {}",
+            Red.bold().paint(&error.col),
+            Yellow.bold().paint(&error.key),
+            error.err
         );
     }
     if store_validator.is_failed() {
@@ -69,5 +69,9 @@ fn main() {
         process::exit(1);
     } else {
         println!("{}", Green.bold().paint("No errors found"));
+    }
+    let gc_counters = store_validator.get_gc_counters();
+    for (col, count) in gc_counters {
+        println!("{} {}", White.bold().paint(col), count);
     }
 }

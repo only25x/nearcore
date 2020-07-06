@@ -27,7 +27,7 @@ pub enum ChunkId {
 }
 
 /// Timeout for establishing connection.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 type HttpRequest<T> = LocalBoxFuture<'static, Result<T, String>>;
 type RpcRequest<T> = LocalBoxFuture<'static, Result<T, RpcError>>;
@@ -154,8 +154,8 @@ macro_rules! jsonrpc_client {
     ) => (
         $(#[$struct_attr])*
         pub struct $struct_name {
-            server_addr: String,
-            client: Client,
+            pub server_addr: String,
+            pub client: Client,
         }
 
         impl $struct_name {

@@ -658,14 +658,14 @@ impl ShardsManager {
                 .entry(shard_id)
                 .and_modify(|stored_chunk| {
                     let epoch_id = unwrap_or_return!(
-                        runtime_adapter.get_epoch_id_from_prev_block(&known_header.prev_hash)
+                        runtime_adapter.get_epoch_id_from_prev_block(known_header.prev_hash())
                     );
                     let block_producer =
                         unwrap_or_return!(runtime_adapter.get_block_producer(&epoch_id, height));
                     if runtime_adapter
                         .verify_validator_signature(
                             &epoch_id,
-                            &known_header.prev_hash,
+                            &known_header.prev_hash(),
                             &block_producer,
                             header.hash.as_ref(),
                             &header.signature,
@@ -1265,7 +1265,7 @@ impl ShardsManager {
                 .collect(),
         };
 
-        store_update.save_partial_chunk(&chunk_entry.header.chunk_hash(), partial_chunk);
+        store_update.save_partial_chunk(partial_chunk);
     }
 
     pub fn decode_and_persist_encoded_chunk(
@@ -1297,7 +1297,7 @@ impl ShardsManager {
             );
 
             // Decoded a valid chunk, store it in the permanent store
-            store_update.save_chunk(&chunk_hash, shard_chunk);
+            store_update.save_chunk(shard_chunk);
             store_update.commit()?;
 
             self.requested_partial_encoded_chunks.remove(&chunk_hash);
@@ -1443,21 +1443,25 @@ impl ShardsManager {
 mod test {
     use crate::test_utils::SealsManagerTestFixture;
     use crate::{
-        ChunkRequestInfo, Seal, SealsManager, ShardsManager, ACCEPTING_SEAL_PERIOD_MS,
-        CHUNK_REQUEST_RETRY_MS, NUM_PARTS_REQUESTED_IN_SEAL, PAST_SEAL_HEIGHT_HORIZON,
+        ChunkRequestInfo, Seal, SealsManager, ShardsManager, CHUNK_REQUEST_RETRY_MS,
+        NUM_PARTS_REQUESTED_IN_SEAL, PAST_SEAL_HEIGHT_HORIZON,
     };
     use near_chain::test_utils::KeyValueRuntime;
-    use near_chain::{ChainStore, RuntimeAdapter};
-    use near_crypto::KeyType;
-    use near_logger_utils::init_test_logger;
     use near_network::test_utils::MockNetworkAdapter;
-    use near_primitives::hash::{hash, CryptoHash};
-    use near_primitives::merkle::merklize;
-    use near_primitives::sharding::{ChunkHash, ReedSolomonWrapper};
-    use near_primitives::validator_signer::InMemoryValidatorSigner;
+    use near_primitives::hash::hash;
+    use near_primitives::sharding::ChunkHash;
     use near_store::test_utils::create_test_store;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[cfg(feature = "expensive_tests")]
+    use {
+        crate::ACCEPTING_SEAL_PERIOD_MS, near_chain::ChainStore, near_chain::RuntimeAdapter,
+        near_crypto::KeyType, near_logger_utils::init_test_logger,
+        near_primitives::hash::CryptoHash, near_primitives::merkle::merklize,
+        near_primitives::sharding::ReedSolomonWrapper,
+        near_primitives::validator_signer::InMemoryValidatorSigner,
+    };
 
     /// should not request partial encoded chunk from self
     #[test]

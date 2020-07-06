@@ -45,6 +45,8 @@ pub type NumSeats = u64;
 /// Block height delta that measures the difference between `BlockHeight`s.
 pub type BlockHeightDelta = u64;
 
+pub type GCCount = u64;
+
 pub type ReceiptIndex = usize;
 pub type PromiseId = Vec<ReceiptIndex>;
 
@@ -473,13 +475,6 @@ impl ChunkExtra {
     }
 }
 
-/// Data structure for semver version and github tag or commit.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct Version {
-    pub version: String,
-    pub build: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum BlockId {
@@ -536,9 +531,6 @@ pub enum ValidatorKickoutReason {
     DidNotGetASeat,
 }
 
-#[derive(PartialEq, Eq, Clone, Debug, BorshSerialize, BorshDeserialize, Serialize)]
-pub struct StateHeaderKey(pub ShardId, pub CryptoHash);
-
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TransactionOrReceiptId {
@@ -564,4 +556,6 @@ pub trait EpochInfoProvider {
         epoch_id: &EpochId,
         last_block_hash: &CryptoHash,
     ) -> Result<Balance, EpochError>;
+
+    fn minimum_stake(&self, prev_block_hash: &CryptoHash) -> Result<Balance, EpochError>;
 }

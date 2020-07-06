@@ -8,9 +8,8 @@ use std::time::{Duration, Instant};
 
 use actix::{Actor, Context, Handler};
 use cached::{Cached, SizedCache};
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 
-use near_chain::types::ShardStateSyncResponse;
 use near_chain::{
     Chain, ChainGenesis, ChainStoreAccess, DoomslugThresholdMode, ErrorKind, RuntimeAdapter,
 };
@@ -25,6 +24,7 @@ use near_primitives::block::{BlockHeader, GenesisId, Tip};
 use near_primitives::hash::CryptoHash;
 use near_primitives::merkle::{merklize, verify_path, PartialMerkleTree};
 use near_primitives::network::AnnounceAccount;
+use near_primitives::syncing::ShardStateSyncResponse;
 use near_primitives::types::{
     AccountId, BlockHeight, BlockId, BlockIdOrFinality, Finality, MaybeBlockId,
     TransactionOrReceiptId,
@@ -113,7 +113,7 @@ impl ViewClientActor {
     ) -> Result<CryptoHash, near_chain::Error> {
         match block_id {
             None => Ok(self.chain.head()?.last_block_hash),
-            Some(BlockId::Height(height)) => Ok(self.chain.get_header_by_height(height)?.hash()),
+            Some(BlockId::Height(height)) => Ok(*self.chain.get_header_by_height(height)?.hash()),
             Some(BlockId::Hash(block_hash)) => Ok(block_hash),
         }
     }
@@ -133,9 +133,9 @@ impl ViewClientActor {
     fn get_block_hash_by_finality(&mut self, finality: &Finality) -> Result<CryptoHash, Error> {
         let head_header = self.chain.head_header()?;
         match finality {
-            Finality::None => Ok(head_header.hash),
-            Finality::DoomSlug => Ok(head_header.inner_rest.last_ds_final_block),
-            Finality::Final => Ok(head_header.inner_rest.last_final_block),
+            Finality::None => Ok(*head_header.hash()),
+            Finality::DoomSlug => Ok(*head_header.last_ds_final_block()),
+            Finality::Final => Ok(*head_header.last_final_block()),
         }
     }
 
@@ -171,17 +171,17 @@ impl ViewClientActor {
 
         // If we have state for the shard that we query return query result directly.
         // Otherwise route query to peers.
-        match self.chain.get_chunk_extra(&header.hash, shard_id) {
+        match self.chain.get_chunk_extra(header.hash(), shard_id) {
             Ok(chunk_extra) => {
                 let state_root = chunk_extra.state_root;
                 self.runtime_adapter
                     .query(
                         shard_id,
                         &state_root,
-                        header.inner_lite.height,
-                        header.inner_lite.timestamp,
-                        &header.hash,
-                        &header.inner_lite.epoch_id,
+                        header.height(),
+                        header.raw_timestamp(),
+                        header.hash(),
+                        header.epoch_id(),
                         &msg.request,
                     )
                     .map(Some)
@@ -276,8 +276,10 @@ impl ViewClientActor {
                             for receipt_id in execution_outcome.outcome.receipt_ids {
                                 self.request_receipt_outcome(receipt_id, &head.last_block_hash)?;
                             }
+                            return Ok(None);
+                        } else {
+                            return Err(TxStatusError::MissingTransaction(tx_hash));
                         }
-                        return Err(TxStatusError::MissingTransaction(tx_hash));
                     }
                     _ => {
                         warn!(target: "client", "Error trying to get transaction result: {}", e.to_string());
@@ -316,7 +318,7 @@ impl ViewClientActor {
         let mut headers = vec![];
         let max_height = self.chain.header_head()?.height;
         // TODO: this may be inefficient if there are a lot of skipped blocks.
-        for h in header.inner_lite.height + 1..=max_height {
+        for h in header.height() + 1..=max_height {
             if let Ok(header) = self.chain.get_header_by_height(h) {
                 headers.push(header.clone());
                 if headers.len() >= sync::MAX_BLOCK_HEADERS as usize {
@@ -390,10 +392,7 @@ impl Handler<GetBlock> for ViewClientActor {
         }
         .and_then(|block| {
             self.runtime_adapter
-                .get_block_producer(
-                    &block.header.inner_lite.epoch_id,
-                    block.header.inner_lite.height,
-                )
+                .get_block_producer(&block.header().epoch_id(), block.header().height())
                 .map(|author| BlockView::from_author_block(author, block))
         })
         .map_err(|err| err.to_string())
@@ -422,7 +421,7 @@ impl Handler<GetChunk> for ViewClientActor {
             GetChunk::BlockHash(block_hash, shard_id) => {
                 self.chain.get_block(&block_hash).map(Clone::clone).and_then(|block| {
                     let chunk_hash = block
-                        .chunks
+                        .chunks()
                         .get(shard_id as usize)
                         .ok_or_else(|| {
                             near_chain::Error::from(ErrorKind::InvalidShardId(shard_id))
@@ -434,7 +433,7 @@ impl Handler<GetChunk> for ViewClientActor {
             GetChunk::Height(height, shard_id) => {
                 self.chain.get_block_by_height(height).map(Clone::clone).and_then(|block| {
                     let chunk_hash = block
-                        .chunks
+                        .chunks()
                         .get(shard_id as usize)
                         .ok_or_else(|| {
                             near_chain::Error::from(ErrorKind::InvalidShardId(shard_id))
@@ -447,7 +446,7 @@ impl Handler<GetChunk> for ViewClientActor {
         .and_then(|chunk| {
             self.chain
                 .get_block_by_height(chunk.header.height_included)
-                .map(|block| (block.header.inner_lite.epoch_id.clone(), chunk))
+                .map(|block| (block.header().epoch_id().clone(), chunk))
         })
         .and_then(|(epoch_id, chunk)| {
             self.runtime_adapter
@@ -520,9 +519,9 @@ impl Handler<GetNextLightClientBlock> for ViewClientActor {
     fn handle(&mut self, request: GetNextLightClientBlock, _: &mut Context<Self>) -> Self::Result {
         let last_block_header =
             self.chain.get_block_header(&request.last_block_hash).map_err(|err| err.to_string())?;
-        let last_epoch_id = last_block_header.inner_lite.epoch_id.clone();
-        let last_next_epoch_id = last_block_header.inner_lite.next_epoch_id.clone();
-        let last_height = last_block_header.inner_lite.height;
+        let last_epoch_id = last_block_header.epoch_id().clone();
+        let last_next_epoch_id = last_block_header.next_epoch_id().clone();
+        let last_height = last_block_header.height();
         let head = self.chain.head().map_err(|err| err.to_string())?;
 
         if last_epoch_id == head.epoch_id || last_next_epoch_id == head.epoch_id {
@@ -586,7 +585,7 @@ impl Handler<GetExecutionOutcome> for ViewClientActor {
                             .chain
                             .get_block(&h)
                             .map_err(|e| e.to_string())?
-                            .chunks
+                            .chunks()
                             .iter()
                             .map(|header| header.inner.outcome_root)
                             .collect::<Vec<_>>();
@@ -727,9 +726,9 @@ impl Handler<NetworkViewClientMessages> for ViewClientActor {
                             self.chain.get_next_block_hash_with_new_chunk(&block_hash, shard_id)
                         {
                             if let Ok(block) = self.chain.get_block(&next_block_hash) {
-                                if shard_id < block.chunks.len() as u64 {
+                                if shard_id < block.chunks().len() as u64 {
                                     if verify_path(
-                                        block.chunks[shard_id as usize].inner.outcome_root,
+                                        block.chunks()[shard_id as usize].inner.outcome_root,
                                         &response.proof,
                                         &response.outcome_with_id.to_hashes(),
                                     ) {
@@ -778,7 +777,7 @@ impl Handler<NetworkViewClientMessages> for ViewClientActor {
                     NetworkViewClientResponses::ChainInfo {
                         genesis_id: GenesisId {
                             chain_id: self.config.chain_id.clone(),
-                            hash: self.chain.genesis().hash(),
+                            hash: *self.chain.genesis().hash(),
                         },
                         height,
                         tracked_shards: self.config.tracked_shards.clone(),
@@ -790,8 +789,8 @@ impl Handler<NetworkViewClientMessages> for ViewClientActor {
                 }
             },
             NetworkViewClientMessages::StateRequestHeader { shard_id, sync_hash } => {
-                let state_response = match self.chain.get_block(&sync_hash) {
-                    Ok(_) => {
+                let state_response = match self.chain.check_sync_hash_validity(&sync_hash) {
+                    Ok(true) => {
                         let header = match self.chain.get_state_response_header(shard_id, sync_hash)
                         {
                             Ok(header) => Some(header),
@@ -802,12 +801,22 @@ impl Handler<NetworkViewClientMessages> for ViewClientActor {
                         };
                         ShardStateSyncResponse { header, part: None }
                     }
-                    Err(_) => {
-                        // This case may appear in case of latency in epoch switching.
-                        // Request sender is ready to sync but we still didn't get the block.
-                        info!(target: "sync", "Can't get sync_hash block {:?} for state request header", sync_hash);
-                        ShardStateSyncResponse { header: None, part: None }
+                    Ok(false) => {
+                        warn!(target: "sync", "sync_hash {:?} didn't pass validation, possible malicious behavior", sync_hash);
+                        return NetworkViewClientResponses::NoResponse;
                     }
+                    Err(e) => match e.kind() {
+                        ErrorKind::DBNotFoundErr(_) => {
+                            // This case may appear in case of latency in epoch switching.
+                            // Request sender is ready to sync but we still didn't get the block.
+                            info!(target: "sync", "Can't get sync_hash block {:?} for state request header", sync_hash);
+                            ShardStateSyncResponse { header: None, part: None }
+                        }
+                        _ => {
+                            error!(target: "sync", "Failed to verify sync_hash {:?} validity, {:?}", sync_hash, e);
+                            ShardStateSyncResponse { header: None, part: None }
+                        }
+                    },
                 };
                 NetworkViewClientResponses::StateResponse(Box::new(StateResponseInfo {
                     shard_id,
@@ -816,8 +825,9 @@ impl Handler<NetworkViewClientMessages> for ViewClientActor {
                 }))
             }
             NetworkViewClientMessages::StateRequestPart { shard_id, sync_hash, part_id } => {
-                let state_response = match self.chain.get_block(&sync_hash) {
-                    Ok(_) => {
+                trace!(target: "sync", "Computing state request part {} {} {}", shard_id, sync_hash, part_id);
+                let state_response = match self.chain.check_sync_hash_validity(&sync_hash) {
+                    Ok(true) => {
                         let part = match self
                             .chain
                             .get_state_response_part(shard_id, part_id, sync_hash)
@@ -828,14 +838,26 @@ impl Handler<NetworkViewClientMessages> for ViewClientActor {
                                 None
                             }
                         };
+
+                        trace!(target: "sync", "Finish computation for state request part {} {} {}", shard_id, sync_hash, part_id);
                         ShardStateSyncResponse { header: None, part }
                     }
-                    Err(_) => {
-                        // This case may appear in case of latency in epoch switching.
-                        // Request sender is ready to sync but we still didn't get the block.
-                        info!(target: "sync", "Can't get sync_hash block {:?} for state request part", sync_hash);
-                        ShardStateSyncResponse { header: None, part: None }
+                    Ok(false) => {
+                        warn!(target: "sync", "sync_hash {:?} didn't pass validation, possible malicious behavior", sync_hash);
+                        return NetworkViewClientResponses::NoResponse;
                     }
+                    Err(e) => match e.kind() {
+                        ErrorKind::DBNotFoundErr(_) => {
+                            // This case may appear in case of latency in epoch switching.
+                            // Request sender is ready to sync but we still didn't get the block.
+                            info!(target: "sync", "Can't get sync_hash block {:?} for state request part", sync_hash);
+                            ShardStateSyncResponse { header: None, part: None }
+                        }
+                        _ => {
+                            error!(target: "sync", "Failed to verify sync_hash {:?} validity, {:?}", sync_hash, e);
+                            ShardStateSyncResponse { header: None, part: None }
+                        }
+                    },
                 };
                 NetworkViewClientResponses::StateResponse(Box::new(StateResponseInfo {
                     shard_id,
@@ -886,8 +908,6 @@ impl Handler<GetGasPrice> for ViewClientActor {
         let header = self
             .maybe_block_id_to_block_hash(msg.block_id)
             .and_then(|block_hash| self.chain.get_block_header(&block_hash));
-        header
-            .map(|b| GasPriceView { gas_price: b.inner_rest.gas_price })
-            .map_err(|e| e.to_string())
+        header.map(|b| GasPriceView { gas_price: b.gas_price() }).map_err(|e| e.to_string())
     }
 }
