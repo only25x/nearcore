@@ -225,11 +225,7 @@ impl EpochManager {
             let stake = epoch_info.validators[*validator_id as usize].stake;
             *versions.entry(version).or_insert(0) += stake;
         }
-        let total_block_producer_stake: u128 = epoch_info
-            .block_producers_settlement
-            .iter()
-            .map(|id| epoch_info.validators[*id as usize].stake)
-            .sum();
+        let total_block_producer_stake: u128 = epoch_info.validators.iter().map(|v| v.stake).sum();
 
         let next_version = if let Some((&version, stake)) =
             versions.into_iter().max_by(|left, right| left.1.cmp(&right.1))
@@ -2931,6 +2927,38 @@ mod tests {
         assert_eq!(epoch_manager.get_epoch_info(&EpochId(h[2])).unwrap().protocol_version, 0);
         assert_eq!(
             epoch_manager.get_epoch_info(&EpochId(h[4])).unwrap().protocol_version,
+            PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn test_protocol_version_switch_with_many_seats() {
+        let store = create_test_store();
+        let config = epoch_config(10, 1, 10, 0, 90, 60, 0);
+        let amount_staked = 1_000_000;
+        let validators = vec![stake("test1", amount_staked), stake("test2", amount_staked / 5)];
+        let mut epoch_manager = EpochManager::new(
+            store.clone(),
+            config.clone(),
+            0,
+            default_reward_calculator(),
+            validators.clone(),
+        )
+        .unwrap();
+        let h = hash_range(50);
+        record_block(&mut epoch_manager, CryptoHash::default(), h[0], 0, vec![]);
+        let mut block_info1 = block_info(1, 1, h[0], h[0], h[0], vec![], DEFAULT_TOTAL_SUPPLY);
+        block_info1.latest_protocol_version = 0;
+        epoch_manager.record_block_info(&h[1], block_info1, [0; 32]).unwrap();
+        for i in 2..32 {
+            record_block(&mut epoch_manager, h[i - 1], h[i], i as u64, vec![]);
+        }
+        assert_eq!(
+            epoch_manager.get_epoch_info(&EpochId(h[10])).unwrap().protocol_version,
+            PROTOCOL_VERSION
+        );
+        assert_eq!(
+            epoch_manager.get_epoch_info(&EpochId(h[20])).unwrap().protocol_version,
             PROTOCOL_VERSION
         );
     }
