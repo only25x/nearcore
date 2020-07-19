@@ -225,7 +225,13 @@ impl EpochManager {
             let stake = epoch_info.validators[*validator_id as usize].stake;
             *versions.entry(version).or_insert(0) += stake;
         }
-        let total_block_producer_stake: u128 = epoch_info.validators.iter().map(|v| v.stake).sum();
+        let total_block_producer_stake: u128 = epoch_info
+            .block_producers_settlement
+            .iter()
+            .collect::<HashSet<_>>()
+            .iter()
+            .map(|&id| epoch_info.validators[*id as usize].stake)
+            .sum();
 
         let next_version = if let Some((&version, stake)) =
             versions.into_iter().max_by(|left, right| left.1.cmp(&right.1))
@@ -2934,7 +2940,8 @@ mod tests {
     #[test]
     fn test_protocol_version_switch_with_many_seats() {
         let store = create_test_store();
-        let config = epoch_config(10, 1, 10, 0, 90, 60, 0);
+        let mut config = epoch_config(10, 1, 4, 0, 90, 60, 0);
+        config.num_block_producer_seats_per_shard = vec![10];
         let amount_staked = 1_000_000;
         let validators = vec![stake("test1", amount_staked), stake("test2", amount_staked / 5)];
         let mut epoch_manager = EpochManager::new(
